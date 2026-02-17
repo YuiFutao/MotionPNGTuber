@@ -440,6 +440,9 @@ class BgVideo:
         self._last_t = time.perf_counter()
         self._cached: np.ndarray | None = None
 
+        # リサイズ必要性を初回判定（毎フレームの条件分岐を削減）
+        self._needs_resize = False
+
         fr = self._read_one()
         if fr is None:
             raise RuntimeError(f"Failed to read first frame: {path}")
@@ -458,15 +461,22 @@ class BgVideo:
         if self.total_frames:
             self.frame_idx %= self.total_frames
 
+        # 初回のみサイズチェック（2フレーム目以降は_needs_resizeフラグで判定）
+        if self.frame_idx <= 1:
+            if self.scale_mode == "fill":
+                self._needs_resize = (bgr.shape[1] != self._fill_rw or bgr.shape[0] != self._fill_rh)
+            else:
+                self._needs_resize = (bgr.shape[1] != self.w or bgr.shape[0] != self.h)
+
         if self.scale_mode == "fill":
             # scale-to-fill + center-crop
-            if bgr.shape[1] != self._fill_rw or bgr.shape[0] != self._fill_rh:
+            if self._needs_resize:
                 bgr = cv2.resize(bgr, (self._fill_rw, self._fill_rh), interpolation=cv2.INTER_AREA)
             # center-crop
             bgr = bgr[self._fill_dy:self._fill_dy + self.h, self._fill_dx:self._fill_dx + self.w]
         else:
             # fit mode
-            if bgr.shape[1] != self.w or bgr.shape[0] != self.h:
+            if self._needs_resize:
                 bgr = cv2.resize(bgr, (self.w, self.h), interpolation=cv2.INTER_AREA)
 
         return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
