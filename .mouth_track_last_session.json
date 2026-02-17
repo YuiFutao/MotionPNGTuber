@@ -1,0 +1,17 @@
+{
+  "audio_device": 3,
+  "video": "C:/Users/whiz7/Downloads/PNGTuber/02/口消し＆再エンコ.mp4",
+  "source_video": "C:/Users/whiz7/Downloads/PNGTuber/02/口消し＆再エンコ.mp4",
+  "mouth_dir": "C:/Users/whiz7/Downloads/PNGTuber/mouth-yui",
+  "coverage": 0.6967741935483871,
+  "pad": 2.0,
+  "character": "",
+  "emotion_preset": "安定（配信向け）",
+  "emotion_hud": true,
+  "smoothing": "普通（3.0）",
+  "track": "C:\\Users\\whiz7\\Downloads\\PNGTuber\\02\\Good Loops\\mouth_track.npz",
+  "track_calibrated": "C:\\Users\\whiz7\\Downloads\\PNGTuber\\02\\Good Loops\\mouth_track_calibrated.npz",
+  "erase_shading": "none",
+  "mouth_sensitivity": 3,
+  "body_sway": true
+}

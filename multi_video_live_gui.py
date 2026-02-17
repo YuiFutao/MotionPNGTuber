@@ -937,8 +937,6 @@ class LiveRunner:
         # Audio setup
         samplerate = _get_input_samplerate(self.audio_device)
         hop = int(samplerate / 100)
-        window = np.hanning(hop).astype(np.float32)
-        freqs = np.fft.rfftfreq(hop, d=1.0 / samplerate)
 
         # Emotion auto setup
         if self.emotion_auto:
@@ -959,12 +957,8 @@ class LiveRunner:
             elif len(x) > hop:
                 x = x[:hop]
             rms_raw = float(np.sqrt(np.mean(x * x) + 1e-12))
-            w = x * window
-            mag = np.abs(np.fft.rfft(w)) + 1e-9
-            centroid = float((freqs * mag).sum() / mag.sum())
-            centroid = float(np.clip(centroid / (samplerate * 0.5), 0.0, 1.0))
             try:
-                self._feat_q.put_nowait((rms_raw, centroid))
+                self._feat_q.put_nowait((rms_raw,))
             except queue.Full:
                 pass
             if self._emo_audio_q is not None:
@@ -989,8 +983,6 @@ class LiveRunner:
             try:
                 samplerate = _get_input_samplerate(None)
                 hop = int(samplerate / 100)
-                window = np.hanning(hop).astype(np.float32)
-                freqs = np.fft.rfftfreq(hop, d=1.0 / samplerate)
                 self._audio_stream = sd.InputStream(
                     samplerate=samplerate,
                     channels=1,
@@ -1023,13 +1015,7 @@ class LiveRunner:
         rms_smooth_q = deque(maxlen=3)
         env_lp = 0.0
         env_hist = deque(maxlen=1000)
-        cent_hist = deque(maxlen=1000)
         TALK_TH, HALF_TH, OPEN_TH = 0.06, 0.30, 0.52
-        U_TH, E_TH = 0.16, 0.20
-
-        current_open_shape = "open"
-        last_vowel_change_t = -999.0
-        e_prev2, e_prev1 = 0.0, 0.0
         mouth_shape_now = "closed"
 
         # Emotion state
@@ -1247,7 +1233,7 @@ class LiveRunner:
                 # Audio updates
                 while True:
                     try:
-                        rms_raw, cent = self._feat_q.get_nowait()
+                        (rms_raw,) = self._feat_q.get_nowait()
                     except queue.Empty:
                         break
 
@@ -1270,7 +1256,6 @@ class LiveRunner:
                     env = float(np.clip(0.75 * env_lp + 0.25 * rms_sm, 0.0, 1.0))
 
                     env_hist.append(env)
-                    cent_hist.append(float(cent))
 
                     # Adaptive thresholds
                     if len(env_hist) > 300 and len(env_hist) % 100 == 0:
@@ -1284,43 +1269,14 @@ class LiveRunner:
                             OPEN_TH = float(np.percentile(talk_vals, 58))
                             HALF_TH = max(HALF_TH, TALK_TH + 0.02)
                             OPEN_TH = max(OPEN_TH, HALF_TH + 0.05)
-                            cents = np.array(cent_hist, dtype=np.float32)
-                            open_mask = vals >= OPEN_TH
-                            cent_open = cents[open_mask] if open_mask.sum() > 20 else cents[vals > TALK_TH]
-                            if len(cent_open) > 20:
-                                U_TH = float(np.percentile(cent_open, 20))
-                                E_TH = float(np.percentile(cent_open, 80))
 
-                    # Mouth level
+                    # 音量ベース3段階の口形判定
                     if env < HALF_TH:
-                        mouth_level = "closed"
+                        mouth_shape_now = "closed"
                     elif env < OPEN_TH:
-                        mouth_level = "half"
-                    else:
-                        mouth_level = "open"
-
-                    # Vowel selection
-                    if mouth_level == "open":
-                        is_peak = (e_prev2 < e_prev1) and (e_prev1 >= env) and (e_prev1 > OPEN_TH + 0.02)
-                        if is_peak and (t - last_vowel_change_t) >= 0.12:
-                            if len(cent_hist) >= 5:
-                                cm = float(np.mean(list(cent_hist)[-5:]))
-                            else:
-                                cm = float(cent)
-                            if cm < U_TH:
-                                current_open_shape = "u"
-                            elif cm > E_TH:
-                                current_open_shape = "e"
-                            else:
-                                current_open_shape = "open"
-                            last_vowel_change_t = t
-                        mouth_shape_now = current_open_shape
-                    elif mouth_level == "half":
                         mouth_shape_now = "half"
                     else:
-                        mouth_shape_now = "closed"
-
-                    e_prev2, e_prev1 = e_prev1, env
+                        mouth_shape_now = "open"
 
                 # Render frame
                 mouth_current = mouth or resolve_mouth_set(loaded, current_emotion)

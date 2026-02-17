@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import datetime
 import json
+import math
 import os
 import platform
 import sys
@@ -491,8 +492,6 @@ def run(args) -> None:
 
     hop = int(samplerate / args.audio_hz)
     hop = max(hop, 256)
-    window = np.hanning(hop).astype(np.float32)
-    freqs = np.fft.rfftfreq(hop, d=1.0 / samplerate)
 
     def audio_cb(indata, frames, time_info, status):
         x = indata.astype(np.float32)
@@ -503,13 +502,9 @@ def run(args) -> None:
         elif len(x) > hop:
             x = x[:hop]
         rms_raw = float(np.sqrt(np.mean(x * x) + 1e-12))
-        w = x * window
-        mag = np.abs(np.fft.rfft(w)) + 1e-9
-        centroid = float((freqs * mag).sum() / mag.sum())
-        centroid = float(np.clip(centroid / (samplerate * 0.5), 0.0, 1.0))
         # Non-blocking put: drop if full (better than blocking audio callback)
         try:
-            feat_q.put_nowait((rms_raw, centroid))
+            feat_q.put_nowait((rms_raw,))
         except queue.Full:
             pass  # Drop sample if queue is full
 
@@ -538,15 +533,17 @@ def run(args) -> None:
     silence_gate_rms = args.silence_gate  # サイレンスゲート閾値
     rms_smooth_q = deque(maxlen=3)
     env_lp = 0.0
+    env = 0.0
     env_hist = deque(maxlen=args.audio_hz * args.hist_sec)
-    cent_hist = deque(maxlen=args.audio_hz * args.hist_sec)
     TALK_TH, HALF_TH, OPEN_TH = 0.06, 0.30, 0.52
-    U_TH, E_TH = 0.16, 0.20
-
-    current_open_shape = "open"
-    last_vowel_change_t = -999.0
-    e_prev2, e_prev1 = 0.0, 0.0
+    HYST = 0.03            # ヒステリシス幅（チャタリング防止）
+    MOUTH_HOLD_SEC = 0.08  # 口形の最小ホールド時間（秒）
     mouth_shape_now = "closed"
+    last_mouth_change_t = 0.0
+
+    # ---- 体揺れ状態 ----
+    sway_phase = 0.0
+    sway_prev_t = time.perf_counter()
 
     # ---- virtual cam ----
     cam = None
@@ -663,14 +660,14 @@ def run(args) -> None:
 
             # ---- audio updates ----
             # Drain all available items from the queue (non-blocking)
-            items: list[tuple[float, float]] = []
+            items: list[tuple[float, ...]] = []
             while True:
                 try:
                     items.append(feat_q.get_nowait())
                 except queue.Empty:
                     break
 
-            for rms_raw, cent in items:
+            for (rms_raw,) in items:
                 if rms_raw < noise + 0.0005:
                     noise = 0.99 * noise + 0.01 * rms_raw
                 else:
@@ -692,7 +689,6 @@ def run(args) -> None:
                 env = float(np.clip(0.75 * env_lp + 0.25 * rms_sm, 0.0, 1.0))
 
                 env_hist.append(env)
-                cent_hist.append(float(cent))
 
                 if len(env_hist) > args.audio_hz * 3 and (len(env_hist) % args.audio_hz == 0):
                     vals = np.array(env_hist, dtype=np.float32)
@@ -702,48 +698,38 @@ def run(args) -> None:
 
                     talk_vals = vals[vals > TALK_TH]
                     if len(talk_vals) > 20:
-                        HALF_TH = float(np.percentile(talk_vals, 25))
-                        OPEN_TH = float(np.percentile(talk_vals, 58))
+                        sens = args.mouth_sensitivity
+                        half_pct = 40 - 7 * (sens - 1)    # 40→33→25→18→12
+                        open_pct = 70 - 7.5 * (sens - 1)  # 70→62.5→55→47.5→40
+                        HALF_TH = float(np.percentile(talk_vals, half_pct))
+                        OPEN_TH = float(np.percentile(talk_vals, open_pct))
                         HALF_TH = max(HALF_TH, TALK_TH + 0.02)
                         OPEN_TH = max(OPEN_TH, HALF_TH + 0.05)
 
-                        cents = np.array(cent_hist, dtype=np.float32)
-                        open_mask = vals >= OPEN_TH
-                        cent_open = cents[open_mask] if open_mask.sum() > 20 else cents[vals > TALK_TH]
-                        if len(cent_open) > 20:
-                            U_TH = float(np.percentile(cent_open, 20))
-                            E_TH = float(np.percentile(cent_open, 80))
+                # 音量ベース3段階の口形判定（ヒステリシス付き）
+                if mouth_shape_now == "closed":
+                    if env >= HALF_TH:
+                        mouth_candidate = "half"
+                    else:
+                        mouth_candidate = "closed"
+                elif mouth_shape_now == "half":
+                    if env < HALF_TH - HYST:
+                        mouth_candidate = "closed"
+                    elif env >= OPEN_TH:
+                        mouth_candidate = "open"
+                    else:
+                        mouth_candidate = "half"
+                else:  # "open"
+                    if env < OPEN_TH - HYST:
+                        mouth_candidate = "half"
+                    else:
+                        mouth_candidate = "open"
 
-                # mouth level
-                if env < HALF_TH:
-                    mouth_level = "closed"
-                elif env < OPEN_TH:
-                    mouth_level = "half"
-                else:
-                    mouth_level = "open"
-
-                # vowel selection on peaks
-                if mouth_level == "open":
-                    is_peak = (e_prev2 < e_prev1) and (e_prev1 >= env) and (e_prev1 > OPEN_TH + args.peak_margin)
-                    if is_peak and (t - last_vowel_change_t) >= args.min_vowel_interval:
-                        if len(cent_hist) >= 5:
-                            cm = float(np.mean(list(cent_hist)[-5:]))
-                        else:
-                            cm = float(cent)
-                        if cm < U_TH:
-                            current_open_shape = "u"
-                        elif cm > E_TH:
-                            current_open_shape = "e"
-                        else:
-                            current_open_shape = "open"
-                        last_vowel_change_t = t
-                    mouth_shape_now = current_open_shape
-                elif mouth_level == "half":
-                    mouth_shape_now = "half"
-                else:
-                    mouth_shape_now = "closed"
-
-                e_prev2, e_prev1 = e_prev1, env
+                # 最小ホールド時間チェック
+                if mouth_candidate != mouth_shape_now:
+                    if (t - last_mouth_change_t) >= MOUTH_HOLD_SEC:
+                        mouth_shape_now = mouth_candidate
+                        last_mouth_change_t = t
 
             # ---- HUD update (main thread) ----
             if hud_root is not None and hud_lbl is not None:
@@ -760,9 +746,24 @@ def run(args) -> None:
                     hud_root = None
                     hud_lbl = None
 
+            # ---- 体揺れ計算 ----
+            sway_offset_y = 0
+            if args.body_sway:
+                sway_now = time.perf_counter()
+                sway_dt = sway_now - sway_prev_t
+                sway_prev_t = sway_now
+                sway_freq = 0.5 + env * 1.0       # 0.5Hz（無音）〜 1.5Hz（発話中）
+                sway_amp = 1.0 + env * 1.5         # ±1px（無音）〜 ±2.5px（発話中）
+                sway_phase += sway_freq * sway_dt * 2.0 * math.pi
+                sway_offset_y = int(sway_amp * math.sin(sway_phase))
+
             # ---- preview ----
             frp = vid_prev.get_frame(now).copy()
             draw_one(frp, vid_prev.frame_idx, track_prev, args.preview_scale)
+            if sway_offset_y != 0:
+                M = np.float32([[1, 0, 0], [0, 1, sway_offset_y]])
+                frp = cv2.warpAffine(frp, M, (frp.shape[1], frp.shape[0]),
+                                     borderMode=cv2.BORDER_REPLICATE)
             cv2.imshow(window_name, cv2.cvtColor(frp, cv2.COLOR_RGB2BGR))
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
@@ -771,6 +772,10 @@ def run(args) -> None:
             if cam is not None and vid_full is not None:
                 frf = vid_full.get_frame(now).copy()
                 draw_one(frf, vid_full.frame_idx, track_full, 1.0)
+                if sway_offset_y != 0:
+                    M = np.float32([[1, 0, 0], [0, 1, sway_offset_y]])
+                    frf = cv2.warpAffine(frf, M, (frf.shape[1], frf.shape[0]),
+                                         borderMode=cv2.BORDER_REPLICATE)
                 cam.send(frf)
                 cam.sleep_until_next_frame()
 
@@ -844,11 +849,13 @@ def parse_args():
                     help="hold: validが無いフレームも近傍で埋めたquadを使う / strict: valid=0は固定貼り")
     ap.add_argument("--draw-quad", action="store_true")
 
-    ap.add_argument("--min-vowel-interval", type=float, default=0.12)
-    ap.add_argument("--peak-margin", type=float, default=0.02)
     ap.add_argument("--silence-gate", type=float, default=0.002,
                     help="サイレンスゲート閾値 (0.001〜0.01, 高いほど無音判定厳しい)")
     ap.add_argument("--hist-sec", type=int, default=10)
+    ap.add_argument("--mouth-sensitivity", type=int, default=3, choices=range(1, 6),
+                    help="口パク感度 1(鈍感)〜5(敏感)、デフォルト3")
+    ap.add_argument("--body-sway", action="store_true",
+                    help="音量連動の体揺れを有効にする")
 
     ap.add_argument("--emotion", default="", help="起動時に選択する感情フォルダ名（mouth_dir配下）。空なら自動選択")
     ap.add_argument("--no-emotion-gui", action="store_true", help="感情選択GUIを表示しない（CLI指定のみで切替）")

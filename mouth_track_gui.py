@@ -362,6 +362,10 @@ class App(tk.Tk):
         self.coverage_var = tk.DoubleVar(value=_safe_float(sess.get("coverage", 0.60), 0.60, min_v=0.40, max_v=0.90))
         self.pad_var = tk.DoubleVar(value=_safe_float(sess.get("pad", 2.10), 2.10, min_v=1.00, max_v=3.00))
 
+        # --- 口パク感度・体揺れ ---
+        self.mouth_sensitivity_var = tk.IntVar(value=int(sess.get("mouth_sensitivity", 3)))
+        self.body_sway_var = tk.BooleanVar(value=_safe_bool(sess.get("body_sway", False), default=False))
+
         # erase shading preset (GUI only): plane=ON, none=OFF
         _esh = sess.get("erase_shading", sess.get("shading", "plane"))
         _esh_str = str(_esh).lower()
@@ -511,6 +515,31 @@ class App(tk.Tk):
             text="HUD（😊表示）",
             variable=self.emotion_hud_var,
             command=lambda: save_session({"emotion_hud": bool(self.emotion_hud_var.get())}),
+        ).pack(side="left", padx=8)
+
+        # 口パク感度 + 体揺れ
+        row5 = ttk.Frame(frm)
+        row5.pack(fill="x", pady=(0, 10))
+
+        self._sens_label = ttk.Label(row5, text=f"口パク感度: {self.mouth_sensitivity_var.get()}")
+        self._sens_label.pack(side="left")
+
+        def _on_sens_change(_val=None):
+            v = int(float(self.mouth_sensitivity_var.get()))
+            self.mouth_sensitivity_var.set(v)
+            self._sens_label.config(text=f"口パク感度: {v}")
+            save_session({"mouth_sensitivity": v})
+
+        ttk.Scale(
+            row5, from_=1, to=5, variable=self.mouth_sensitivity_var,
+            orient="horizontal", command=_on_sens_change,
+        ).pack(side="left", fill="x", expand=True, padx=8)
+
+        ttk.Checkbutton(
+            row5,
+            text="体揺れ",
+            variable=self.body_sway_var,
+            command=lambda: save_session({"body_sway": bool(self.body_sway_var.get())}),
         ).pack(side="left", padx=8)
 
         # Buttons (workflow)
@@ -831,6 +860,8 @@ class App(tk.Tk):
             "character": self.character_var.get(),
             "emotion_preset": self.emotion_preset_var.get(),
             "emotion_hud": bool(self.emotion_hud_var.get()),
+            "mouth_sensitivity": int(self.mouth_sensitivity_var.get()),
+            "body_sway": bool(self.body_sway_var.get()),
         })
 
     def on_pick_mouth_dir(self) -> None:
@@ -849,6 +880,8 @@ class App(tk.Tk):
             "character": self.character_var.get(),
             "emotion_preset": self.emotion_preset_var.get(),
             "emotion_hud": bool(self.emotion_hud_var.get()),
+            "mouth_sensitivity": int(self.mouth_sensitivity_var.get()),
+            "body_sway": bool(self.body_sway_var.get()),
         })
 
     def on_stop(self) -> None:
@@ -1654,6 +1687,14 @@ class App(tk.Tk):
                         cmd += ["--emotion-hud-alpha", "0.92"]
                 else:
                     self.log("[warn] runtime が感情オートに未対応のため、従来モードで実行します。")
+
+                # 口パク感度
+                if self._runtime_supports(runtime_py, ["--mouth-sensitivity"]):
+                    cmd += ["--mouth-sensitivity", str(int(self.mouth_sensitivity_var.get()))]
+
+                # 体揺れ
+                if self.body_sway_var.get() and self._runtime_supports(runtime_py, ["--body-sway"]):
+                    cmd.append("--body-sway")
                 self.log("[cmd] " + " ".join(cmd))
                 self._progress_begin(1, "ライブ準備中…")
                 self._progress_step(1, "ライブ実行中…")
