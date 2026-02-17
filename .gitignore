@@ -208,3 +208,5 @@ __marimo__/
 
 # Dependencies (for Mac)
 deps/
+.mouth_track_last_session.json
+/.claude
